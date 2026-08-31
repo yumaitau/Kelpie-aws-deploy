@@ -1,0 +1,137 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/yumaitau/kelpie
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+env:
+  NODE_ENV: production
+  NEXT_TELEMETRY_DISABLED: "1"
+  APP_URL: https://kelpie.example.com
+  BETTER_AUTH_URL: https://kelpie.example.com
+  PORT: "3000"
+  S3_FORCE_PATH_STYLE: "false"
+  # The containers run with a read-only root filesystem, so npm must keep its
+  # cache and logs under the writable /tmp mount instead of the home directory.
+  NPM_CONFIG_CACHE: "/tmp/.npm"
+  NPM_CONFIG_UPDATE_NOTIFIER: "false"
+
+secretEnv:
+  DATABASE_URL: ""
+  REDIS_URL: ""
+  VALKEY_URL: ""
+  BETTER_AUTH_SECRET: ""
+  AUTH_SECRET: ""
+  APP_SECRET: ""
+  EMAIL_PROVIDER: "none"
+  STORAGE_PROVIDER: "local"
+
+existingSecret: ""
+extraEnvFrom: []
+extraEnv: []
+
+web:
+  command: []
+  args: []
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  startupProbe:
+    path: /api/health
+    periodSeconds: 10
+    failureThreshold: 18
+  readinessProbe:
+    path: /api/health
+    initialDelaySeconds: 10
+  livenessProbe:
+    path: /api/health
+    initialDelaySeconds: 30
+
+worker:
+  enabled: true
+  replicaCount: 1
+  # args (not command): Kubernetes command replaces image ENTRYPOINT.
+  # Image entrypoint waits for Postgres and migrates before exec.
+  args:
+    - node
+    - dist/jobs-worker.cjs
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+migration:
+  enabled: true
+  asHelmHook: true
+  args:
+    - node
+    - dist/migrate.cjs
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: ""
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 25m
+  hosts:
+    - host: kelpie.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+postgresql:
+  external:
+    recommended: true
+    note: Use managed Postgres in production and provide DATABASE_URL through secretEnv or existingSecret.
+
+redis:
+  external:
+    recommended: true
+    note: Use managed Redis or Valkey in production and provide REDIS_URL/VALKEY_URL through secretEnv or existingSecret.
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

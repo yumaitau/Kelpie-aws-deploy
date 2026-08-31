@@ -1,0 +1,50 @@
+# AWS Marketplace overlay for Amazon EKS.
+# Same image as terraform/. Helm Quick Launch is retired; this file is the
+# EKS buyer path.
+#
+# Helm does not create RDS, Redis, S3, ACM, or SES. Provision those first.
+# Production evidence storage is S3 (not the chart default STORAGE_PROVIDER=local).
+# HTTPS terminates on your Ingress / NLB / ALB — not an extra IAM role.
+# Email is optional: leave EMAIL_PROVIDER=none until a verified identity exists.
+# First user still registers at /sign-up with no mail.
+#
+#   helm upgrade --install kelpie charts/kelpie \
+#     --namespace kelpie --create-namespace \
+#     -f charts/kelpie/values-aws-marketplace.yaml \
+#     --set env.APP_URL=https://kelpie.example.com \
+#     --set env.BETTER_AUTH_URL=https://kelpie.example.com \
+#     --set env.STORAGE_DRIVER=s3 \
+#     --set env.S3_BUCKET=<your-bucket> \
+#     --set secretEnv.STORAGE_PROVIDER=s3 \
+#     --set secretEnv.DATABASE_URL='postgresql://...' \
+#     --set secretEnv.REDIS_URL='rediss://...' \
+#     --set secretEnv.VALKEY_URL='rediss://...' \
+#     --set secretEnv.BETTER_AUTH_SECRET='...' \
+#     --set secretEnv.AUTH_SECRET='...' \
+#     --set secretEnv.APP_SECRET='...'
+#
+# Pin image.tag (or repository@digest via a custom image.repository) to a
+# 1.0.3+ listing digest. Marketplace ECR pulls need an entitled subscription,
+# not a GitHub token.
+#
+# The Marketplace image validates its entitlement at startup. Licensing cannot
+# be disabled through Helm values or environment variables. CheckoutLicense uses
+# the pod IRSA role. Set serviceAccount.annotations.eks.amazonaws.com/role-arn
+# and attach iam-policy.json plus S3/KMS (and ses:SendEmail if using SES).
+
+image:
+  repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws
+  tag: "sha-pending"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT:role/kelpie
+
+env:
+  SIGNUP_MODE: open
+  NEXT_PUBLIC_SIGNUP_MODE: open

@@ -1,0 +1,1724 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Kelpie on ECS Fargate. Buyer-owned VPC, ALB, RDS PostgreSQL 16, ElastiCache Redis,
+  KMS, Secrets Manager, and a private S3 evidence bucket. ALB ingress CIDR is required;
+  0.0.0.0/0 needs AllowInternetIngress. Subscribe on AWS Marketplace before creating
+  this stack. Parity target is first-launch Terraform defaults (single NAT). Dual-NAT
+  production egress stays on the Terraform stack.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@2
+  com.aws.cloudformation.Context:
+    must:
+      - ALB SG ingress never 0.0.0.0/0 unless AllowInternetIngress
+    ref:
+      - { at: cloudformation/README.md, has: launch + ingress, scope: companion }
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Marketplace
+        Parameters:
+          - ContainerImage
+          - MarketplaceProductCode
+          - MarketplaceProductSku
+          - MarketplacePublicKeyVersion
+          - MarketplaceEnforceContainerLicense
+      - Label:
+          default: Names
+        Parameters:
+          - NamePrefix
+          - Environment
+      - Label:
+          default: Network
+        Parameters:
+          - VpcCidr
+          - AllowedIngressCidr
+          - AllowInternetIngress
+      - Label:
+          default: Optional HTTPS and email
+        Parameters:
+          - CertificateArn
+          - AppUrl
+          - SesFromEmail
+      - Label:
+          default: Data plane
+        Parameters:
+          - DatabaseInstanceClass
+          - DatabaseMultiAz
+          - CacheNodeType
+          - CacheHighAvailability
+          - EnableWaf
+          - EnableAwsBackup
+    ParameterLabels:
+      ContainerImage:
+        default: Marketplace container image
+      MarketplaceProductCode:
+        default: Listing product code
+      MarketplaceProductSku:
+        default: Listing product ID (SKU)
+      MarketplaceEnforceContainerLicense:
+        default: Deprecated — ignored by 1.0.3+
+      CertificateArn:
+        default: ACM certificate ARN (HTTPS)
+      SesFromEmail:
+        default: Verified SES From identity
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Default: kelpie
+    AllowedPattern: "^[a-z][a-z0-9-]{1,15}$"
+    Description: Short prefix for AWS resource names.
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedPattern: "^[a-z][a-z0-9-]{1,15}$"
+    Description: Deployment environment name.
+
+  ContainerImage:
+    Type: String
+    Default: "709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws:sha-pending"
+    AllowedPattern: ".*(@sha256:[0-9a-f]{64}|:[A-Za-z0-9][A-Za-z0-9_.-]{0,127})$"
+    Description: Marketplace ECR image tag or digest. Do not use :latest.
+
+  MarketplaceProductCode:
+    Type: String
+    Default: ""
+    Description: Deprecated and ignored. Kelpie 1.0.3+ embeds Marketplace product identity in the image.
+
+  MarketplaceProductSku:
+    Type: String
+    Default: ""
+    Description: Deprecated and ignored. Kelpie 1.0.3+ embeds the License Manager ProductSKU in the image.
+
+  MarketplacePublicKeyVersion:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Deprecated and ignored. Hourly RegisterUsage is not used by the public contract listing.
+
+  MarketplaceEnforceContainerLicense:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Deprecated and ignored. Marketplace images 1.0.3+ always enforce CheckoutLicense.
+
+  VpcCidr:
+    Type: String
+    Default: 10.80.0.0/16
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/(1[6-9]|2[0-8]))$"
+    Description: CIDR for the Kelpie VPC.
+
+  AllowedIngressCidr:
+    Type: String
+    AllowedPattern: "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\\/([0-9]|[1-2][0-9]|3[0-2]))$"
+    ConstraintDescription: IPv4 CIDR (for example 203.0.113.0/24). 0.0.0.0/0 requires AllowInternetIngress=true.
+    Description: IPv4 CIDR allowed to reach the ALB. Required. 0.0.0.0/0 is rejected unless AllowInternetIngress is true.
+
+  AllowInternetIngress:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Permit 0.0.0.0/0 on the ALB. Off by default. Use only for a public service behind WAF and HTTPS.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN in the stack Region. Empty = HTTP ALB for a first launch.
+
+  AppUrl:
+    Type: String
+    Default: ""
+    Description: Canonical public URL (https://hostname). Empty uses the ALB URL.
+
+  SesFromEmail:
+    Type: String
+    Default: ""
+    Description: Verified Amazon SES From identity. Empty disables outbound email.
+
+  DatabaseInstanceClass:
+    Type: String
+    Default: db.t4g.micro
+    Description: RDS PostgreSQL instance class.
+
+  DatabaseMultiAz:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Multi-AZ RDS. Enable for production.
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    Description: ElastiCache node type.
+
+  CacheHighAvailability:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Redis primary + replica with failover. Enable for production.
+
+  EnableWaf:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Associate an AWS managed-rule WAFv2 ACL with the ALB.
+
+  EnableAwsBackup:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Protect RDS and the evidence bucket with AWS Backup.
+
+  WebDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of web tasks.
+
+  WorkerDesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Number of worker tasks.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: CloudWatch log retention.
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasAppUrl: !Not [!Equals [!Ref AppUrl, ""]]
+  HasSes: !Not [!Equals [!Ref SesFromEmail, ""]]
+  HasMarketplace: !Not [!Equals [!Ref MarketplaceProductCode, ""]]
+  HasMarketplaceSku: !And
+    - !Condition HasMarketplace
+    - !Not [!Equals [!Ref MarketplaceProductSku, ""]]
+  DatabaseIsMultiAz: !Equals [!Ref DatabaseMultiAz, "true"]
+  CacheIsHa: !Equals [!Ref CacheHighAvailability, "true"]
+  WafEnabled: !Equals [!Ref EnableWaf, "true"]
+  BackupEnabled: !Equals [!Ref EnableAwsBackup, "true"]
+
+Rules:
+  NoWorldOpenIngress:
+    RuleCondition: !Equals [!Ref AllowInternetIngress, "false"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AllowedIngressCidr, "0.0.0.0/0"]]
+        AssertDescription: AllowedIngressCidr cannot be 0.0.0.0/0 unless AllowInternetIngress is true.
+
+Resources:
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "Kelpie ${Environment} data encryption"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: CloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${NamePrefix}-${Environment}
+      TargetKeyId: !Ref EncryptionKey
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-vpc
+        - Key: Application
+          Value: Kelpie
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-igw
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 22, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-public-1
+        - Key: Tier
+          Value: public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 22, 8]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-public-2
+        - Key: Tier
+          Value: public
+
+  ApplicationSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [10, !Cidr [!Ref VpcCidr, 22, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-application-1
+        - Key: Tier
+          Value: private-application
+
+  ApplicationSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [11, !Cidr [!Ref VpcCidr, 22, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-application-2
+        - Key: Tier
+          Value: private-application
+
+  DataSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [20, !Cidr [!Ref VpcCidr, 22, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-data-1
+        - Key: Tier
+          Value: private-data
+
+  DataSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [21, !Cidr [!Ref VpcCidr, 22, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-data-2
+        - Key: Tier
+          Value: private-data
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-nat-1
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-nat-1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-public
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  ApplicationRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-application
+
+  ApplicationDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ApplicationRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  ApplicationSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ApplicationRouteTable
+      SubnetId: !Ref ApplicationSubnet1
+
+  ApplicationSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref ApplicationRouteTable
+      SubnetId: !Ref ApplicationSubnet2
+
+  DataRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-data
+
+  DataSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DataRouteTable
+      SubnetId: !Ref DataSubnet1
+
+  DataSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref DataRouteTable
+      SubnetId: !Ref DataSubnet2
+
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref ApplicationRouteTable
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-s3
+
+  FlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: vpc-flow-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt FlowLogsGroup.Arn
+                  - !Sub ${FlowLogsGroup.Arn}:*
+
+  FlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /vpc/${NamePrefix}-${Environment}/flow-logs
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref Vpc
+      ResourceType: VPC
+      TrafficType: ALL
+      DeliverLogsPermissionArn: !GetAtt FlowLogsRole.Arn
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogsGroup
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ingress to Kelpie ALB
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-alb
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Kelpie Fargate web and worker tasks
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-tasks
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private PostgreSQL access from Kelpie tasks
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-database
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private Redis access from Kelpie tasks
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-cache
+
+  # ALB SG only — not shared with tasks, RDS, or Redis.
+  AlbHttpIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: HTTP
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedIngressCidr
+
+  AlbHttpsIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasCertificate
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: HTTPS
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AllowedIngressCidr
+
+  AlbToWebEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      Description: Web task traffic
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      DestinationSecurityGroupId: !Ref TaskSecurityGroup
+
+  WebFromAlbIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: ALB to web task
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  TasksHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: HTTPS dependencies and Marketplace ECR pulls
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  TasksDnsUdpEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: VPC DNS over UDP
+      IpProtocol: udp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+
+  TasksDnsTcpEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: VPC DNS over TCP
+      IpProtocol: tcp
+      FromPort: 53
+      ToPort: 53
+      CidrIp: !Ref VpcCidr
+
+  TasksToDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: PostgreSQL
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref DatabaseSecurityGroup
+
+  DatabaseFromTasksIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      Description: PostgreSQL from tasks
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+
+  TasksToCacheEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      Description: Redis TLS
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref CacheSecurityGroup
+
+  CacheFromTasksIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref CacheSecurityGroup
+      Description: Redis from tasks
+      IpProtocol: tcp
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: Access-log destination cannot log to itself
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub ${LogsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AlbAccessLogs
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LogsBucket.Arn}/alb/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: S3AccessLogs
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ${LogsBucket.Arn}/s3/evidence/*
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: LogsBucketPolicy
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogsBucket
+        LogFilePrefix: s3/evidence/
+      LifecycleConfiguration:
+        Rules:
+          - Id: evidence-maintenance
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Application
+          Value: Kelpie
+
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub ${EvidenceBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  DatabasePassword:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie RDS master password
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+        SecretStringTemplate: '{"username":"kelpieadmin"}'
+        GenerateStringKey: password
+
+  CachePassword:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie Redis AUTH token
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 40
+        ExcludePunctuation: true
+        SecretStringTemplate: '{"password":""}'
+        GenerateStringKey: password
+
+  BetterAuthSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie BETTER_AUTH_SECRET
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  AuthSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie AUTH_SECRET
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  AppSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie APP_SECRET
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  ServerActionsSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie NEXT_SERVER_ACTIONS_ENCRYPTION_KEY
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  DatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Kelpie PostgreSQL
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-database
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub ${NamePrefix}-${Environment}-postgres
+      Engine: postgres
+      EngineVersion: "16.13"
+      DBInstanceClass: !Ref DatabaseInstanceClass
+      DBName: kelpie
+      MasterUsername: kelpieadmin
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DatabasePassword}:SecretString:password}}"
+      Port: 5432
+      AllocatedStorage: 20
+      MaxAllocatedStorage: 100
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      DBSubnetGroupName: !Ref DatabaseSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: !If [DatabaseIsMultiAz, true, false]
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      AutoMinorVersionUpgrade: true
+      DeletionProtection: false
+      EnableCloudwatchLogsExports:
+        - postgresql
+        - upgrade
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-postgres
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Kelpie Redis
+      SubnetIds:
+        - !Ref DataSubnet1
+        - !Ref DataSubnet2
+
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub ${NamePrefix}-${Environment}-cache
+      ReplicationGroupDescription: Kelpie Redis-compatible cache and queue
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref CacheNodeType
+      Port: 6379
+      CacheParameterGroupName: default.redis7
+      NumCacheClusters: !If [CacheIsHa, 2, 1]
+      AutomaticFailoverEnabled: !If [CacheIsHa, true, false]
+      MultiAZEnabled: !If [CacheIsHa, true, false]
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+      TransitEncryptionEnabled: true
+      AuthToken: !Sub "{{resolve:secretsmanager:${CachePassword}:SecretString:password}}"
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-cache
+
+  RuntimeSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: Kelpie runtime connection strings and application secrets
+      KmsKeyId: !Ref EncryptionKey
+      SecretString: !Sub |
+        {
+          "DATABASE_URL": "postgresql://kelpieadmin:{{resolve:secretsmanager:${DatabasePassword}:SecretString:password}}@${Database.Endpoint.Address}:5432/kelpie?sslmode=require",
+          "REDIS_URL": "rediss://:{{resolve:secretsmanager:${CachePassword}:SecretString:password}}@${Cache.PrimaryEndPoint.Address}:6379",
+          "VALKEY_URL": "rediss://:{{resolve:secretsmanager:${CachePassword}:SecretString:password}}@${Cache.PrimaryEndPoint.Address}:6379",
+          "BETTER_AUTH_SECRET": "{{resolve:secretsmanager:${BetterAuthSecret}:SecretString}}",
+          "AUTH_SECRET": "{{resolve:secretsmanager:${AuthSecret}:SecretString}}",
+          "APP_SECRET": "{{resolve:secretsmanager:${AppSecret}:SecretString}}",
+          "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY": "{{resolve:secretsmanager:${ServerActionsSecret}:SecretString}}"
+        }
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: runtime-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadRuntimeSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref RuntimeSecret
+              - Sid: DecryptRuntimeSecret
+                Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt EncryptionKey.Arn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:*
+      Policies:
+        - PolicyName: evidence-storage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListEvidenceBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt EvidenceBucket.Arn
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - uploads/*
+              - Sid: ManageEvidenceObjects
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub ${EvidenceBucket.Arn}/uploads/*
+              - Sid: UseEvidenceKey
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:Encrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt EncryptionKey.Arn
+
+  TaskSesPolicy:
+    Type: AWS::IAM::Policy
+    Condition: HasSes
+    Properties:
+      PolicyName: amazon-ses-send
+      Roles:
+        - !Ref TaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AmazonSesSend
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: !Sub arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/*
+
+  TaskMarketplacePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: aws-marketplace-container-license
+      Roles:
+        - !Ref TaskRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AwsMarketplaceContainerLicense
+            Effect: Allow
+            Action:
+              - license-manager:CheckoutLicense
+              - license-manager:GetLicense
+              - license-manager:CheckInLicense
+              - license-manager:ExtendLicenseConsumption
+              - license-manager:ListReceivedLicenses
+            Resource: "*"
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${NamePrefix}-${Environment}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${NamePrefix}-${Environment}/web
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${NamePrefix}-${Environment}/worker
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  MigrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/${NamePrefix}-${Environment}/migration
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: LogsBucketPolicy
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: "true"
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref LogsBucket
+        - Key: access_logs.s3.prefix
+          Value: alb
+      Tags:
+        - Key: Name
+          Value: !Sub ${NamePrefix}-${Environment}-web
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref Vpc
+      HealthCheckEnabled: true
+      HealthCheckPath: /api/health
+      Matcher:
+        HttpCode: "200"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Host: "#{host}"
+              Path: "/#{path}"
+              Port: "443"
+              Protocol: HTTPS
+              Query: "#{query}"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: WafEnabled
+    Properties:
+      Name: !Sub ${NamePrefix}-${Environment}-web
+      Description: AWS managed baseline protection for Kelpie
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${NamePrefix}-${Environment}-web
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: AWSManagedRulesAnonymousIpList
+          Priority: 5
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesAnonymousIpList
+              VendorName: AWS
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${NamePrefix}-${Environment}-anonymous-ip
+            SampledRequestsEnabled: true
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 10
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesCommonRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${NamePrefix}-${Environment}-common
+            SampledRequestsEnabled: true
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 20
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+              VendorName: AWS
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub ${NamePrefix}-${Environment}-known-bad-inputs
+            SampledRequestsEnabled: true
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: WafEnabled
+    DependsOn: HttpListener
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WafEnabled
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-${NamePrefix}-${Environment}
+      RetentionInDays: !Ref LogRetentionDays
+      KmsKeyId: !GetAtt EncryptionKey.Arn
+
+  WafLogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Condition: WafEnabled
+    Properties:
+      PolicyName: !Sub ${NamePrefix}-${Environment}-waf-logs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "delivery.logs.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${WafLogGroup.Arn}:*",
+            "Condition": {
+              "StringEquals": {"aws:SourceAccount": "${AWS::AccountId}"},
+              "ArnLike": {"aws:SourceArn": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"}
+            }
+          }]
+        }
+
+  WebAclLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: WafEnabled
+    DependsOn: WafLogResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${NamePrefix}-${Environment}-web
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "1024"
+      Memory: "2048"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref ContainerImage
+          Essential: true
+          User: nextjs
+          Privileged: false
+          LinuxParameters:
+            Capabilities:
+              Drop:
+                - ALL
+          Command:
+            - node
+            - server.js
+          PortMappings:
+            - Name: http
+              ContainerPort: 3000
+              HostPort: 3000
+              Protocol: tcp
+              AppProtocol: http
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: HOSTNAME
+              Value: "0.0.0.0"
+            - Name: NEXT_TELEMETRY_DISABLED
+              Value: "1"
+            - Name: APP_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: BETTER_AUTH_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: STORAGE_DRIVER
+              Value: s3
+            - Name: S3_BUCKET
+              Value: !Ref EvidenceBucket
+            - Name: S3_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: KELPIE_VALIDATE_RUNTIME_CONFIG
+              Value: "true"
+            - Name: ALLOW_INSECURE_PUBLIC_URL
+              Value: !If [HasCertificate, "false", "true"]
+            - Name: SIGNUP_MODE
+              Value: open
+            - Name: NEXT_PUBLIC_SIGNUP_MODE
+              Value: open
+            - !If
+              - HasSes
+              - Name: EMAIL_PROVIDER
+                Value: ses
+              - !Ref AWS::NoValue
+            - !If
+              - HasSes
+              - Name: EMAIL_FROM
+                Value: !Ref SesFromEmail
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub "${RuntimeSecret}:DATABASE_URL::"
+            - Name: REDIS_URL
+              ValueFrom: !Sub "${RuntimeSecret}:REDIS_URL::"
+            - Name: VALKEY_URL
+              ValueFrom: !Sub "${RuntimeSecret}:VALKEY_URL::"
+            - Name: BETTER_AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:BETTER_AUTH_SECRET::"
+            - Name: AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:AUTH_SECRET::"
+            - Name: APP_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:APP_SECRET::"
+            - Name: NEXT_SERVER_ACTIONS_ENCRYPTION_KEY
+              ValueFrom: !Sub "${RuntimeSecret}:NEXT_SERVER_ACTIONS_ENCRYPTION_KEY::"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - >-
+                node -e "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 180
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${NamePrefix}-${Environment}-worker
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Ref ContainerImage
+          Essential: true
+          User: nextjs
+          Privileged: false
+          LinuxParameters:
+            Capabilities:
+              Drop:
+                - ALL
+          Command:
+            - node
+            - dist/jobs-worker.cjs
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: HOSTNAME
+              Value: "0.0.0.0"
+            - Name: NEXT_TELEMETRY_DISABLED
+              Value: "1"
+            - Name: APP_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: BETTER_AUTH_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: STORAGE_DRIVER
+              Value: s3
+            - Name: S3_BUCKET
+              Value: !Ref EvidenceBucket
+            - Name: S3_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: KELPIE_VALIDATE_RUNTIME_CONFIG
+              Value: "true"
+            - Name: ALLOW_INSECURE_PUBLIC_URL
+              Value: !If [HasCertificate, "false", "true"]
+            - Name: SIGNUP_MODE
+              Value: open
+            - Name: NEXT_PUBLIC_SIGNUP_MODE
+              Value: open
+            - !If
+              - HasSes
+              - Name: EMAIL_PROVIDER
+                Value: ses
+              - !Ref AWS::NoValue
+            - !If
+              - HasSes
+              - Name: EMAIL_FROM
+                Value: !Ref SesFromEmail
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub "${RuntimeSecret}:DATABASE_URL::"
+            - Name: REDIS_URL
+              ValueFrom: !Sub "${RuntimeSecret}:REDIS_URL::"
+            - Name: VALKEY_URL
+              ValueFrom: !Sub "${RuntimeSecret}:VALKEY_URL::"
+            - Name: BETTER_AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:BETTER_AUTH_SECRET::"
+            - Name: AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:AUTH_SECRET::"
+            - Name: APP_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:APP_SECRET::"
+            - Name: NEXT_SERVER_ACTIONS_ENCRYPTION_KEY
+              ValueFrom: !Sub "${RuntimeSecret}:NEXT_SERVER_ACTIONS_ENCRYPTION_KEY::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+
+  MigrationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${NamePrefix}-${Environment}-migration
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: migration
+          Image: !Ref ContainerImage
+          Essential: true
+          User: nextjs
+          Privileged: false
+          LinuxParameters:
+            Capabilities:
+              Drop:
+                - ALL
+          Command:
+            - node
+            - dist/migrate.cjs
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: HOSTNAME
+              Value: "0.0.0.0"
+            - Name: NEXT_TELEMETRY_DISABLED
+              Value: "1"
+            - Name: APP_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: BETTER_AUTH_URL
+              Value: !If
+                - HasAppUrl
+                - !Ref AppUrl
+                - !Sub
+                  - "${Scheme}://${Dns}"
+                  - Scheme: !If [HasCertificate, https, http]
+                    Dns: !GetAtt LoadBalancer.DNSName
+            - Name: STORAGE_DRIVER
+              Value: s3
+            - Name: S3_BUCKET
+              Value: !Ref EvidenceBucket
+            - Name: S3_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: KELPIE_VALIDATE_RUNTIME_CONFIG
+              Value: "true"
+            - Name: ALLOW_INSECURE_PUBLIC_URL
+              Value: !If [HasCertificate, "false", "true"]
+            - Name: SIGNUP_MODE
+              Value: open
+            - Name: NEXT_PUBLIC_SIGNUP_MODE
+              Value: open
+            - !If
+              - HasSes
+              - Name: EMAIL_PROVIDER
+                Value: ses
+              - !Ref AWS::NoValue
+            - !If
+              - HasSes
+              - Name: EMAIL_FROM
+                Value: !Ref SesFromEmail
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: DATABASE_URL
+              ValueFrom: !Sub "${RuntimeSecret}:DATABASE_URL::"
+            - Name: REDIS_URL
+              ValueFrom: !Sub "${RuntimeSecret}:REDIS_URL::"
+            - Name: VALKEY_URL
+              ValueFrom: !Sub "${RuntimeSecret}:VALKEY_URL::"
+            - Name: BETTER_AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:BETTER_AUTH_SECRET::"
+            - Name: AUTH_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:AUTH_SECRET::"
+            - Name: APP_SECRET
+              ValueFrom: !Sub "${RuntimeSecret}:APP_SECRET::"
+            - Name: NEXT_SERVER_ACTIONS_ENCRYPTION_KEY
+              ValueFrom: !Sub "${RuntimeSecret}:NEXT_SERVER_ACTIONS_ENCRYPTION_KEY::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MigrationLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: migration
+
+  WebService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpListener
+      - Database
+      - Cache
+      - RuntimeSecret
+    Properties:
+      ServiceName: !Sub ${NamePrefix}-${Environment}-web
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WebTaskDefinition
+      DesiredCount: !Ref WebDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets:
+            - !Ref ApplicationSubnet1
+            - !Ref ApplicationSubnet2
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+
+  WorkerService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Database
+      - Cache
+      - RuntimeSecret
+    Properties:
+      ServiceName: !Sub ${NamePrefix}-${Environment}-worker
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref WorkerTaskDefinition
+      DesiredCount: !Ref WorkerDesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets:
+            - !Ref ApplicationSubnet1
+            - !Ref ApplicationSubnet2
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Condition: BackupEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Backup
+        - arn:aws:iam::aws:policy/AWSBackupServiceRolePolicyForS3Restore
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: BackupEnabled
+    Properties:
+      BackupVaultName: !Sub ${NamePrefix}-${Environment}-backup
+      EncryptionKeyArn: !GetAtt EncryptionKey.Arn
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: BackupEnabled
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub ${NamePrefix}-${Environment}-daily
+        BackupPlanRule:
+          - RuleName: daily
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 16 * * ? *)
+            Lifecycle:
+              DeleteAfterDays: 35
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: BackupEnabled
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub ${NamePrefix}-${Environment}-protected
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:${NamePrefix}-${Environment}-postgres
+          - !GetAtt EvidenceBucket.Arn
+
+Outputs:
+  ApplicationUrl:
+    Description: Public Kelpie URL.
+    Value: !If
+      - HasAppUrl
+      - !Ref AppUrl
+      - !Sub
+        - "${Scheme}://${Dns}"
+        - Scheme: !If [HasCertificate, https, http]
+          Dns: !GetAtt LoadBalancer.DNSName
+
+  LoadBalancerDnsName:
+    Description: ALB DNS name.
+    Value: !GetAtt LoadBalancer.DNSName
+
+  ContainerImage:
+    Description: Image used by every task definition.
+    Value: !Ref ContainerImage
+
+  EcsClusterName:
+    Description: ECS cluster used by services and one-shot tasks.
+    Value: !Ref Cluster
+
+  WebTaskDefinitionArn:
+    Description: Web task definition ARN.
+    Value: !Ref WebTaskDefinition
+
+  WorkerTaskDefinitionArn:
+    Description: Worker task definition ARN.
+    Value: !Ref WorkerTaskDefinition
+
+  MigrationTaskDefinitionArn:
+    Description: One-shot migration task definition ARN.
+    Value: !Ref MigrationTaskDefinition
+
+  ApplicationSubnetIds:
+    Description: Private subnets for Fargate tasks.
+    Value: !Sub "${ApplicationSubnet1},${ApplicationSubnet2}"
+
+  TaskSecurityGroupId:
+    Description: Security group for Fargate tasks.
+    Value: !Ref TaskSecurityGroup
+
+  EvidenceBucketName:
+    Description: Private KMS-encrypted S3 evidence bucket.
+    Value: !Ref EvidenceBucket
+
+  RuntimeSecretArn:
+    Description: Secrets Manager ARN referenced by task definitions. Secret values are never output.
+    Value: !Ref RuntimeSecret
+
+  MigrationLogGroupName:
+    Description: CloudWatch log group for migration tasks.
+    Value: !Ref MigrationLogGroup
+
