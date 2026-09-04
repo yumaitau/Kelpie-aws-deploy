@@ -9,7 +9,7 @@
   },
   {
     "ParameterKey": "ContainerImage",
-    "ParameterValue": "709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws:sha-pending"
+    "ParameterValue": "709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws:1.0.0"
   },
   {
     "ParameterKey": "AllowedIngressCidr",
