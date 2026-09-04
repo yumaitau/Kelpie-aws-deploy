@@ -3,7 +3,7 @@ name_prefix     = "kelpie"
 environment     = "prod"
 # Pin to a Marketplace ECR tag or digest that already exists.
 # Do not invent a version tag. Do not use :latest.
-container_image = "709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws:sha-pending"
+container_image = "709825985650.dkr.ecr.us-east-1.amazonaws.com/yuma-it/kelpie-aws:1.0.0"
 
 # Marketplace product identity is baked into the image.
 # Do not set AWS_MARKETPLACE_* environment variables to disable licensing.
